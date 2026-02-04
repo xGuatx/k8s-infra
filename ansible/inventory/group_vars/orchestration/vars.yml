@@ -1,0 +1,3 @@
+---
+# Orchestration group inherits from all.yml
+# This file ensures vault variables are available for k8s-orchestrator

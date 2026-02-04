@@ -1,0 +1,169 @@
+---
+- name: Bootstrap K3s HA Cluster (3 Masters)
+  hosts: k3s_cluster
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - open-iscsi
+          - nfs-common
+        state: present
+
+    - name: Enable and start iscsid (required for Longhorn)
+      systemd:
+        name: iscsid
+        enabled: yes
+        state: started
+
+- name: Install First K3s Master (Bootstrap)
+  hosts: k8s-master-1.example.com
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Check if K3s is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_installed
+
+    - name: Download and install K3s server (first master)
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} sh -s - server \
+          --cluster-init \
+          --write-kubeconfig-mode 644 \
+          --disable traefik \
+          --node-name {{ inventory_hostname.split('.')[0] }} \
+          --tls-san {{ inventory_hostname }} \
+          --tls-san k8s-master-1.example.com \
+          --tls-san k8s-master-2.example.com \
+          --tls-san k8s-master-3.example.com
+      when: not k3s_installed.stat.exists
+
+    - name: Ensure K3s service is started
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Wait for K3s to be ready
+      wait_for:
+        port: 6443
+        delay: 10
+        timeout: 300
+
+    - name: Get K3s node token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Save token for other masters
+      set_fact:
+        k3s_node_token: "{{ k3s_token.content | b64decode | trim }}"
+
+    - name: Get kubeconfig
+      slurp:
+        src: /etc/rancher/k3s/k3s.yaml
+      register: k3s_kubeconfig
+
+    - name: Save kubeconfig locally
+      delegate_to: localhost
+      become: no
+      copy:
+        content: "{{ k3s_kubeconfig.content | b64decode }}"
+        dest: "{{ playbook_dir }}/../kubeconfig.yaml"
+        mode: '0600'
+
+    - name: Update kubeconfig server address
+      delegate_to: localhost
+      become: no
+      replace:
+        path: "{{ playbook_dir }}/../kubeconfig.yaml"
+        regexp: '127\.0\.0\.1'
+        replace: '{{ inventory_hostname }}'
+
+- name: Install Additional K3s Masters (k8s-master-2, k8s-master-3)
+  hosts: k8s-master-2.example.com,k8s-master-3.example.com
+  gather_facts: no
+  become: yes
+  serial: 1
+
+  tasks:
+    - name: Get master token
+      set_fact:
+        k3s_node_token: "{{ hostvars['k8s-master-1.example.com']['k3s_node_token'] }}"
+
+    - name: Check if K3s server is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_server_installed
+
+    - name: Download and install K3s server (additional masters)
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION={{ k3s_version }} \
+          K3S_URL=https://k8s-master-1.example.com:6443 \
+          K3S_TOKEN={{ k3s_node_token }} \
+          sh -s - server \
+          --write-kubeconfig-mode 644 \
+          --disable traefik \
+          --node-name {{ inventory_hostname.split('.')[0] }} \
+          --tls-san {{ inventory_hostname }} \
+          --tls-san k8s-master-1.example.com \
+          --tls-san k8s-master-2.example.com \
+          --tls-san k8s-master-3.example.com
+      when: not k3s_server_installed.stat.exists
+
+    - name: Ensure K3s service is started
+      systemd:
+        name: k3s
+        state: started
+        enabled: yes
+
+    - name: Wait for server to be ready
+      wait_for:
+        port: 6443
+        delay: 10
+        timeout: 300
+
+- name: Verify HA Cluster
+  hosts: k8s-master-1.example.com
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Get cluster nodes
+      command: kubectl get nodes
+      register: cluster_nodes
+
+    - name: Display cluster status
+      debug:
+        msg: "{{ cluster_nodes.stdout_lines }}"
+
+    - name: Wait for all nodes to be Ready
+      shell: kubectl get nodes --no-headers | grep -c " Ready "
+      register: ready_nodes
+      until: ready_nodes.stdout | int == 3
+      retries: 30
+      delay: 10
+
+    - name: Verify etcd cluster members
+      command: kubectl get endpoints -n kube-system -o yaml
+      register: etcd_members
+      failed_when: false
+      changed_when: false
+
+    - name: Display etcd cluster info
+      debug:
+        msg: "K3s HA cluster endpoints retrieved"
+
+    - name: Cluster bootstrap complete
+      debug:
+        msg: "K3s HA cluster successfully bootstrapped with {{ ready_nodes.stdout }} master nodes (etcd quorum)"

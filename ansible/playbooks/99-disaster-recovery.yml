@@ -1,0 +1,316 @@
+---
+- name: DISASTER RECOVERY - Restauration depuis Backups k8s-orchestrator
+  hosts: localhost
+  gather_facts: yes
+  connection: local
+
+  vars:
+    backup_root: "/opt/k8s-backups"
+    backup_timestamp: "{{ backup_to_restore | default('latest') }}"
+    script_dir: "{{ playbook_dir }}/../../scripts"
+
+  vars_prompt:
+    - name: confirm_recovery
+      prompt: "  WARNING: Cela va DETRUIRE et RECONSTRUIRE le cluster complet. Taper 'YES' pour continuer"
+      private: no
+
+  tasks:
+    - name: Verifier confirmation
+      fail:
+        msg: "Recovery annule par l'utilisateur"
+      when: confirm_recovery != "YES"
+
+    - name: Determiner le backup a restaurer
+      shell: ls -t {{ backup_root }} | head -1
+      register: latest_backup_dir
+      when: backup_timestamp == 'latest'
+
+    - name: Definir backup_dir
+      set_fact:
+        backup_dir: "{{ backup_root }}/{{ latest_backup_dir.stdout if backup_timestamp == 'latest' else backup_timestamp }}"
+
+    - name: Verifier que le backup existe
+      stat:
+        path: "{{ backup_dir }}"
+      register: backup_exists
+
+    - name: Echec si backup introuvable
+      fail:
+        msg: "Backup introuvable: {{ backup_dir }}"
+      when: not backup_exists.stat.exists
+
+    - name: Afficher plan de recuperation
+      debug:
+        msg:
+          - ""
+          - "     DISASTER RECOVERY - RESTAURATION COMPLETE          "
+          - ""
+          - ""
+          - "Backup source: {{ backup_dir }}"
+          - ""
+          - "Plan de recuperation:"
+          - "  Phase 1: Restauration secrets & configuration (1 min)"
+          - "  Phase 2: Reconstruction cluster K3s (8 min)"
+          - "  Phase 3: Deploiement infrastructure (15 min)"
+          - "  Phase 4: Restauration donnees MySQL + Drupal (5 min)"
+          - "  Phase 5: Verification finale (2 min)"
+          - ""
+          - "Temps estime: ~31 minutes"
+
+    - name: Enregistrer temps de debut
+      set_fact:
+        recovery_start_time: "{{ ansible_date_time.epoch }}"
+
+# 
+# PHASE 1: RESTAURATION SECRETS
+# 
+- name: Phase 1 - Restauration Secrets & Configuration
+  hosts: localhost
+  gather_facts: no
+  connection: local
+
+  vars:
+    backup_dir: "{{ hostvars['localhost']['backup_dir'] }}"
+    ansible_dir: "{{ playbook_dir }}/.."
+
+  tasks:
+    - name: Afficher phase 1
+      debug:
+        msg: " PHASE 1/5: Restauration Secrets & Configuration "
+
+    - name: Restaurer vault.yml
+      copy:
+        src: "{{ backup_dir }}/secrets/vault.yml"
+        dest: "{{ ansible_dir }}/inventory/group_vars/vault.yml"
+        mode: '0644'
+
+    - name: Restaurer .vault_password
+      copy:
+        src: "{{ backup_dir }}/secrets/.vault_password"
+        dest: "{{ ansible_dir }}/.vault_password"
+        mode: '0600'
+
+    - name: Restaurer kubeconfig (si disponible)
+      copy:
+        src: "{{ backup_dir }}/secrets/kubeconfig.yaml"
+        dest: "{{ ansible_dir }}/kubeconfig.yaml"
+        mode: '0600'
+      ignore_errors: yes
+
+    - name: Secrets restaures
+      debug:
+        msg: " Secrets et configuration restaures"
+
+# 
+# PHASE 2: DESTRUCTION ANCIEN CLUSTER
+# 
+- name: Phase 2a - Destruction Ancien Cluster
+  hosts: k3s_cluster
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Afficher phase 2a
+      debug:
+        msg: " PHASE 2/5: Destruction & Reconstruction Cluster "
+      run_once: yes
+
+    - name: Desinstaller K3s des workers
+      shell: /usr/local/bin/k3s-agent-uninstall.sh
+      when: inventory_hostname in groups['k3s_workers']
+      failed_when: false
+
+    - name: Desinstaller K3s du master
+      shell: /usr/local/bin/k3s-uninstall.sh
+      when: inventory_hostname in groups['k3s_masters']
+      failed_when: false
+
+    - name: Attendre nettoyage
+      pause:
+        seconds: 15
+      run_once: yes
+
+# 
+# PHASE 2b: RECONSTRUCTION CLUSTER K3S
+# 
+- name: Phase 2b - Reconstruction Cluster K3s
+  import_playbook: 00-bootstrap-k3s.yml
+
+# 
+# PHASE 3: DEPLOIEMENT INFRASTRUCTURE
+# 
+- name: Phase 3 - Deploiement Infrastructure
+  import_playbook: 01-deploy-infrastructure.yml
+
+- name: Phase 3b - Configuration Securite
+  import_playbook: 03-configure-security.yml
+
+- name: Phase 3c - Configuration Velero
+  import_playbook: 02-configure-velero-backups.yml
+
+# 
+# PHASE 4: RESTAURATION DONNEES
+# 
+- name: Phase 4 - Restauration Donnees MySQL et Drupal
+  hosts: localhost
+  gather_facts: no
+  connection: local
+
+  vars:
+    backup_dir: "{{ hostvars['localhost']['backup_dir'] }}"
+    kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Afficher phase 4
+      debug:
+        msg: " PHASE 4/5: Restauration Donnees "
+
+    - name: Attendre pods MySQL ready
+      command: kubectl wait --for=condition=ready pod -l app=mysql -n drupal --timeout=300s
+      retries: 3
+      delay: 10
+
+    - name: Obtenir le nom du pod MySQL
+      shell: kubectl get pod -n drupal -l app=mysql -o jsonpath='{.items[0].metadata.name}'
+      register: mysql_pod_name
+
+    - name: Trouver le dump MySQL le plus recent
+      shell: ls -t {{ backup_dir }}/mysql/*.sql.gz | head -1
+      register: mysql_dump_file
+      failed_when: false
+
+    - name: Restaurer MySQL si dump disponible
+      block:
+        - name: Afficher fichier dump
+          debug:
+            msg: "Restauration MySQL depuis {{ mysql_dump_file.stdout }}"
+
+        - name: Copier dump dans le pod
+          shell: kubectl cp {{ mysql_dump_file.stdout }} drupal/{{ mysql_pod_name.stdout }}:/tmp/restore.sql.gz
+
+        - name: Restaurer dump MySQL
+          shell: |
+            kubectl exec -n drupal {{ mysql_pod_name.stdout }} -- bash -c \
+              "gunzip < /tmp/restore.sql.gz | MYSQL_PWD=\$(cat /run/secrets/mysql-secret/mysql-root-password) mysql -u root"
+
+        - name: MySQL restaure
+          debug:
+            msg: " MySQL restaure avec succes"
+      when: mysql_dump_file.stdout != ""
+
+    - name: Attendre pods Drupal ready
+      command: kubectl wait --for=condition=ready pod -l app=drupal -n drupal --timeout=300s
+      retries: 3
+      delay: 10
+
+    - name: Obtenir le nom du pod Drupal
+      shell: kubectl get pod -n drupal -l app=drupal -o jsonpath='{.items[0].metadata.name}'
+      register: drupal_pod_name
+
+    - name: Trouver fichiers Drupal
+      shell: ls -t {{ backup_dir }}/drupal-files/*.tar.gz | head -1
+      register: drupal_files
+      failed_when: false
+
+    - name: Restaurer fichiers Drupal si disponibles
+      block:
+        - name: Copier fichiers dans le pod
+          shell: kubectl cp {{ drupal_files.stdout }} drupal/{{ drupal_pod_name.stdout }}:/tmp/files.tar.gz
+
+        - name: Extraire fichiers
+          shell: |
+            kubectl exec -n drupal {{ drupal_pod_name.stdout }} -- \
+              tar xzf /tmp/files.tar.gz -C /var/www/html/sites/default/files/
+
+        - name: Fichiers Drupal restaures
+          debug:
+            msg: " Fichiers Drupal restaures"
+      when: drupal_files.stdout != ""
+
+    - name: Tentative restauration Velero (si disponible)
+      shell: |
+        velero backup get | grep -q backup || exit 0
+        LATEST_VELERO=$(velero backup get -o json | jq -r '.items | sort_by(.metadata.creationTimestamp) | last | .metadata.name')
+        if [ -n "$LATEST_VELERO" ]; then
+          velero restore create recovery-{{ ansible_date_time.epoch }} --from-backup $LATEST_VELERO --wait
+        fi
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      failed_when: false
+      register: velero_restore
+
+# 
+# PHASE 5: VERIFICATION
+# 
+- name: Phase 5 - Verification Post-Recovery
+  hosts: localhost
+  gather_facts: no
+  connection: local
+
+  vars:
+    kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+    recovery_start_time: "{{ hostvars['localhost']['recovery_start_time'] }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Afficher phase 5
+      debug:
+        msg: " PHASE 5/5: Verification Finale "
+
+    - name: Attendre stabilisation
+      pause:
+        seconds: 30
+
+    - name: Verifier nodes
+      command: kubectl get nodes
+      register: nodes_status
+
+    - name: Verifier pods Drupal
+      command: kubectl get pods -n drupal
+      register: drupal_pods
+
+    - name: Verifier pods monitoring
+      command: kubectl get pods -n monitoring
+      register: monitoring_pods
+
+    - name: Verifier Longhorn
+      command: kubectl get pods -n longhorn-system
+      register: longhorn_pods
+
+    - name: Calculer temps de recuperation
+      set_fact:
+        recovery_duration: "{{ ansible_date_time.epoch | int - recovery_start_time | int }}"
+
+    - name: Afficher resume recovery
+      debug:
+        msg:
+          - ""
+          - "          DISASTER RECOVERY TERMINE                     "
+          - ""
+          - ""
+          - "Temps de recuperation: {{ (recovery_duration | int / 60) | round(0, 'floor') }}m {{ recovery_duration | int % 60 }}s"
+          - ""
+          - " NODES ==="
+          - "{{ nodes_status.stdout_lines }}"
+          - ""
+          - " DRUPAL PODS ==="
+          - "{{ drupal_pods.stdout_lines }}"
+          - ""
+          - " MONITORING PODS ==="
+          - "{{ monitoring_pods.stdout_lines | select('search', 'prometheus|grafana|alertmanager') | list }}"
+          - ""
+          - " ACCES SERVICES ==="
+          - "Drupal:      http://k8s-master-1.example.com:30080"
+          - "Grafana:     http://k8s-master-1.example.com:30300"
+          - "Prometheus:  http://k8s-master-1.example.com:30090"
+          - ""
+          - " PROCHAINES ETAPES ==="
+          - "1. Verifier acces Drupal et contenu"
+          - "2. Verifier replication MySQL"
+          - "3. Creer nouveau backup: ~/k8s-infra/backup/backup-to-k8s-orchestrator.sh"
+          - "4. Monitorer: ~/k8s-infra/scripts/check-cluster-health.sh"

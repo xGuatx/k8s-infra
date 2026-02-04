@@ -1,0 +1,33 @@
+---
+# PodDisruptionBudget for MySQL
+# Ensures at least 2 MySQL pods remain available during node maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: mysql-pdb
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "drupal-stack.labels" . | nindent 4 }}
+    component: mysql
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: mysql
+
+---
+# PodDisruptionBudget for Drupal
+# Ensures at least 1 Drupal pod remains available during node maintenance
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: drupal-pdb
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "drupal-stack.labels" . | nindent 4 }}
+    component: drupal
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: drupal

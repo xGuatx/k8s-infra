@@ -1,0 +1,49 @@
+---
+# Global variables for all hosts
+# Sensitive data in vault.yml (encrypted)
+
+# K3s Configuration
+k3s_version: v1.33.5+k3s1
+k3s_server_ip: k8s-master-1.example.com
+systemd_dir: /etc/systemd/system
+
+# Cluster Configuration
+cluster_name: production
+api_port: 6443
+flannel_backend: vxlan
+
+# Storage
+longhorn_version: v1.7.2
+storage_class_default: longhorn
+
+# Backup Configuration
+backup_enabled: true
+backup_retention_days: 7
+backup_schedule: "0 2 * * *"
+velero_version: v1.15.0
+
+# Monitoring
+prometheus_retention: 15d
+
+# Security
+enable_network_policies: true
+enable_pod_security_policies: true
+cert_manager_version: v1.16.2
+
+# Database (non-sensitive settings)
+mysql_database: "{{ vault_mysql_database }}"
+mysql_user: "{{ vault_mysql_user }}"
+mysql_replicas: 3
+
+# Drupal
+drupal_version: "10"
+drupal_replicas: 3  # 3 replicas for true HA (1 per node)
+
+# Passwords from vault (encrypted)
+# Note: ansible_password and ansible_become_password not needed (SSH keys + sudoers NOPASSWD)
+mysql_root_password: "{{ vault_mysql_root_password }}"
+mysql_password: "{{ vault_mysql_password }}"
+mysql_replication_password: "{{ vault_mysql_replication_password }}"
+grafana_admin_password: "{{ vault_grafana_admin_password }}"
+minio_access_key: "{{ vault_minio_access_key }}"
+minio_secret_key: "{{ vault_minio_secret_key }}"

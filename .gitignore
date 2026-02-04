@@ -1,0 +1,76 @@
+# Ansible
+# Backups
+# Build
+# Certificates
+# Credentials et secrets
+# Docker
+# IDE
+# Kubeconfig
+# Logs
+# Node
+# OS
+# Only commit encrypted vault files
+# Python
+# Sensitive files - NEVER commit
+# Temporary
+# Temporary files
+
+!vault.yml
+*$py.class
+**/vault_password*
+*.crt
+*.key
+*.kubeconfig
+*.log
+*.pem
+*.py[cod]
+*.retry
+*.so
+*.swo
+*.swp
+*.temp
+*.tmp
+*~
+.DS_Store
+.Python
+.ansible/
+.cache-*
+.cache/
+.credentials.json
+.dockerignore
+.env
+.env.*.local
+.env.local
+.env.tmp
+.idea/
+.passwords.txt
+.pnpm-debug.log*
+.vault_password
+.venv
+.vscode/
+CREDENTIALS.txt
+ENV/
+Thumbs.db
+__pycache__/
+auth.json
+backup/*.dump
+backup/*.sql
+backup/*.tar.gz
+build/
+certs/
+dist/
+env/
+id_ed25519
+id_rsa
+kubeconfig.yaml
+logs/
+node_modules/
+npm-debug.log*
+out/
+target/
+venv/
+yarn-debug.log*
+yarn-error.log*
+# Claude Code
+.claude/
+.claude.json

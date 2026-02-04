@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drupal
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "drupal-stack.labels" . | nindent 4 }}
+    component: drupal
+spec:
+  replicas: {{ .Values.drupal.replicaCount }}
+  selector:
+    matchLabels:
+      app: drupal
+  template:
+    metadata:
+      labels:
+        app: drupal
+        {{- include "drupal-stack.selectorLabels" . | nindent 8 }}
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - drupal
+            topologyKey: kubernetes.io/hostname
+      containers:
+      - name: drupal
+        image: {{ .Values.drupal.image.repository }}:{{ .Values.drupal.image.tag }}
+        imagePullPolicy: {{ .Values.drupal.image.pullPolicy }}
+        ports:
+        - containerPort: 80
+          name: http
+        env:
+        - name: DRUPAL_DATABASE_HOST
+          value: {{ .Values.drupal.database.host }}
+        - name: DRUPAL_DATABASE_PORT
+          value: {{ .Values.drupal.database.port | quote }}
+        - name: DRUPAL_DATABASE_NAME
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.drupal.database.existingSecret }}
+              key: mysql-database
+        - name: DRUPAL_DATABASE_USER
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.drupal.database.existingSecret }}
+              key: mysql-user
+        - name: DRUPAL_DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.drupal.database.existingSecret }}
+              key: mysql-password
+        volumeMounts:
+        - name: drupal-files
+          mountPath: /var/www/html/sites/default/files
+        - name: drupal-modules
+          mountPath: /var/www/html/modules
+        - name: drupal-themes
+          mountPath: /var/www/html/themes
+        - name: drupal-profiles
+          mountPath: /var/www/html/profiles
+        resources:
+          {{- toYaml .Values.drupal.resources | nindent 10 }}
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: {{ .Values.healthChecks.liveness.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthChecks.liveness.periodSeconds }}
+          timeoutSeconds: {{ .Values.healthChecks.liveness.timeoutSeconds }}
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: {{ .Values.healthChecks.readiness.initialDelaySeconds }}
+          periodSeconds: {{ .Values.healthChecks.readiness.periodSeconds }}
+          timeoutSeconds: {{ .Values.healthChecks.readiness.timeoutSeconds }}
+      volumes:
+      - name: drupal-files
+        persistentVolumeClaim:
+          claimName: drupal-files
+      - name: drupal-modules
+        emptyDir: {}
+      - name: drupal-themes
+        emptyDir: {}
+      - name: drupal-profiles
+        emptyDir: {}

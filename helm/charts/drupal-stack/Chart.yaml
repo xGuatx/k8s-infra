@@ -1,0 +1,13 @@
+apiVersion: v2
+name: drupal-stack
+description: Production-grade Drupal with MySQL replication
+type: application
+version: 1.0.0
+appVersion: "10.0"
+keywords:
+  - drupal
+  - mysql
+  - cms
+maintainers:
+  - name: Infrastructure Team
+    email: admin@example.com

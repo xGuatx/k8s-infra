@@ -1,0 +1,322 @@
+---
+- name: Configure Complete Monitoring Stack with Dashboards
+  hosts: k8s-orchestrator.example.com
+  become: no
+  connection: local
+  gather_facts: no
+
+  vars:
+    grafana_admin_password: "{{ vault_grafana_admin_password }}"
+
+  tasks:
+    - name: Wait for Grafana to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=grafana \
+          -n monitoring \
+          --timeout=300s
+      environment:
+        KUBECONFIG: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+    - name: Deployer le MySQL Exporter (Deployment)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: mysql-exporter
+            namespace: monitoring
+            labels:
+              app: mysql-exporter
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: mysql-exporter
+            template:
+              metadata:
+                labels:
+                  app: mysql-exporter
+              spec:
+                containers:
+                - name: mysql-exporter
+                  image: prom/mysqld-exporter:v0.15.0
+                  env:
+                  - name: DATA_SOURCE_NAME
+                    value: "root:{{ vault_mysql_root_password }}@tcp(mysql-primary.drupal.svc.cluster.local:3306)/"
+                  ports:
+                  - containerPort: 9104
+                    name: metrics
+
+    - name: Exposer le MySQL Exporter (Service)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: mysql-exporter
+            namespace: monitoring
+            labels:
+              app: mysql-exporter
+          spec:
+            selector:
+              app: mysql-exporter
+            ports:
+            - name: metrics
+              port: 9104
+              targetPort: 9104
+
+    - name: Creer le ServiceMonitor pour MySQL Exporter
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: monitoring.coreos.com/v1
+          kind: ServiceMonitor
+          metadata:
+            name: mysql-exporter
+            namespace: monitoring
+            labels:
+              release: kube-prometheus-stack
+          spec:
+            namespaceSelector:
+              matchNames:
+              - monitoring
+            selector:
+              matchLabels:
+                app: mysql-exporter
+            endpoints:
+            - port: metrics
+              interval: 30s
+
+    - name: Create Grafana Dashboard ConfigMap for MySQL
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: mysql-dashboard
+            namespace: monitoring
+            labels:
+              grafana_dashboard: "1"
+          data:
+            mysql-dashboard.json: |
+              {
+                "dashboard": {
+                  "title": "MySQL Performance Dashboard",
+                  "tags": ["mysql", "database"],
+                  "timezone": "browser",
+                  "panels": [
+                    {
+                      "title": "MySQL Connections",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "mysql_global_status_threads_connected",
+                          "legendFormat": "Connections"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Query Rate",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "rate(mysql_global_status_queries[5m])",
+                          "legendFormat": "Queries/sec"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Slow Queries",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "rate(mysql_global_status_slow_queries[5m])",
+                          "legendFormat": "Slow queries/sec"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+
+    - name: Create Grafana Dashboard ConfigMap for Drupal
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: drupal-dashboard
+            namespace: monitoring
+            labels:
+              grafana_dashboard: "1"
+          data:
+            drupal-dashboard.json: |
+              {
+                "dashboard": {
+                  "title": "Drupal Application Dashboard",
+                  "tags": ["drupal", "application"],
+                  "timezone": "browser",
+                  "panels": [
+                    {
+                      "title": "Drupal Pod Status",
+                      "type": "stat",
+                      "targets": [
+                        {
+                          "expr": "count(kube_pod_status_phase{namespace=\"drupal\",pod=~\"drupal-.*\",phase=\"Running\"})",
+                          "legendFormat": "Running Pods"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Drupal CPU Usage",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "sum(rate(container_cpu_usage_seconds_total{namespace=\"drupal\",pod=~\"drupal-.*\"}[5m]))",
+                          "legendFormat": "CPU Usage"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Drupal Memory Usage",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "sum(container_memory_working_set_bytes{namespace=\"drupal\",pod=~\"drupal-.*\"})",
+                          "legendFormat": "Memory Usage"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "HTTP Requests Rate",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "rate(nginx_ingress_controller_requests{namespace=\"drupal\"}[5m])",
+                          "legendFormat": "Requests/sec"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+
+    - name: Create Grafana Dashboard ConfigMap for Cluster Overview
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-overview-dashboard
+            namespace: monitoring
+            labels:
+              grafana_dashboard: "1"
+          data:
+            cluster-overview.json: |
+              {
+                "dashboard": {
+                  "title": "K3s Cluster Overview",
+                  "tags": ["kubernetes", "cluster"],
+                  "timezone": "browser",
+                  "panels": [
+                    {
+                      "title": "Cluster Nodes",
+                      "type": "stat",
+                      "targets": [
+                        {
+                          "expr": "count(kube_node_info)",
+                          "legendFormat": "Total Nodes"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Total Pods",
+                      "type": "stat",
+                      "targets": [
+                        {
+                          "expr": "count(kube_pod_info)",
+                          "legendFormat": "Total Pods"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "CPU Usage by Node",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "100 - (avg by (node) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+                          "legendFormat": "{{node}}"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Memory Usage by Node",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes * 100",
+                          "legendFormat": "{{node}}"
+                        }
+                      ]
+                    },
+                    {
+                      "title": "Disk Usage by Node",
+                      "type": "graph",
+                      "targets": [
+                        {
+                          "expr": "(node_filesystem_size_bytes{mountpoint=\"/\"} - node_filesystem_avail_bytes{mountpoint=\"/\"}) / node_filesystem_size_bytes{mountpoint=\"/\"} * 100",
+                          "legendFormat": "{{node}}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+
+    - name: Restart Grafana to load dashboards
+      shell: |
+        kubectl rollout restart deployment kube-prometheus-stack-grafana -n monitoring
+        kubectl rollout status deployment kube-prometheus-stack-grafana -n monitoring --timeout=300s
+      environment:
+        KUBECONFIG: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+    - name: Display Grafana access information
+      debug:
+        msg: |
+          
+          MONITORING STACK CONFIGURE
+          
+
+          Grafana Admin Password: {{ grafana_admin_password }}
+
+          Dashboards disponibles:
+          - K3s Cluster Overview
+          - MySQL Performance Dashboard
+          - Drupal Application Dashboard
+
+          Metriques collectees:
+           Cluster Kubernetes (nodes, pods, CPU, RAM, disk)
+           MySQL (connections, queries, slow queries)
+           Drupal (pods, CPU, RAM, HTTP requests)
+           Ingress Nginx (requests, latency, errors)
+
+          Acces Grafana:
+          - HTTP: http://grafana.example.com:30080
+          - HTTPS: https://grafana.example.com (si TLS active)
+
+          Prometheus:
+          - http://k8s-master-1.example.com:30090
+
+          

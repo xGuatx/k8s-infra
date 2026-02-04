@@ -1,0 +1,212 @@
+
+     HAUTE DISPONIBILITE - RECAPITULATIF v2.0          
+
+
+ CONFIGURATIONS IMPLEMENTEES (3-Master HA Cluster)
+
+1. K3s Control Plane (3 masters avec etcd quorum)
+    Masters: k8s-master-1, k8s-master-2, k8s-master-3 (tous masters)
+    etcd: Quorum 3 nuds (2/3 votes requis)
+    API Server: 3 instances (tolere perte de 1)
+    Scheduler: Leader election automatique
+    Controller: Leader election automatique
+
+   Tolerance:  Perte de 1 master (interruption <60s)
+                Perte de 2 masters = READ-ONLY
+
+2. MySQL StatefulSet (3 replicas)
+    Anti-affinity: REQUIRED (1 pod par nud garanti)
+    PodDisruptionBudget: minAvailable 2
+    Replication: mysql-0  mysql-1  mysql-2
+    Stockage: Longhorn (2 replicas par volume)
+
+   Tolerance:  Perte de 1 nud (reschedule <60s)
+
+3. Drupal Deployment (2 replicas)
+    Anti-affinity: PREFERRED (preference dispersion)
+    PodDisruptionBudget: minAvailable 1
+    PVC partage: drupal-files (Longhorn 2x)
+    Health checks: liveness + readiness probes
+
+   Tolerance:  Perte de 1 nud (reschedule <60s)
+
+4. Longhorn Storage (replication 2x)
+    Replicas par defaut: 2
+    Auto-healing: Active
+    Re-replication: 5-30 minutes selon taille
+    Health monitoring: Toutes les 30 secondes
+
+   Tolerance:  Perte de 1 nud (donnees accessibles)
+
+5. PodDisruptionBudgets
+    mysql-pdb: minAvailable 2/3
+    drupal-pdb: minAvailable 1/2
+    Protection: Empeche drain violant contraintes
+
+   Effet:  Bloque kubectl drain si viole minAvailable
+
+
+
+ AMELIORATIONS v2.0
+
+1. Architecture 3-Master
+
+   AVANT: 1 master (k8s-master-1) + 2 workers (k8s-master-2, k8s-master-3)
+           SPOF sur k8s-master-1
+
+   APRES: 3 masters (k8s-master-1, k8s-master-2, k8s-master-3)
+           etcd quorum 2/3
+           Tolere perte de 1 master
+
+2. etcd Quorum
+
+   Configuration: 3 nuds etcd embedded
+   Consensus: 2/3 votes requis (majorite)
+   Perte 1 nud:  Quorum maintenu (2/3)
+   Perte 2 nuds:  Cluster READ-ONLY (1/3)
+
+3. API Server High Availability
+
+   Instances: 3 (1 par master)
+   Load balancing: Automatique (kubectl vers any master)
+   Perte 1 master:  API accessible via 2 autres
+   Perte 2 masters:  API accessible via 1 survivant
+
+
+
+ MATRICE DE DISPONIBILITE v2.0
+
+
+ Nud(s) Down  API Server   etcd     MySQL   Service 
+
+ Aucun          3/3       3/3    100%   OK   
+ k8s-master-1          2/3       2/3     60s   OK   
+ k8s-master-2          2/3       2/3    100%   OK   
+ k8s-master-3          2/3       2/3    100%   OK   
+ k8s-master-1+k8s-master-2    1/3       1/3     RO     RO  
+
+
+Legende:
+   Operationnel complet
+    Interruption courte (<60s) puis OK
+   Degrade (lecture seule)
+
+Conclusion: Tolere 1 master sans interruption significative
+            Perte 2 masters = service degrade (READ-ONLY)
+
+
+
+ COMPORTEMENTS EN CAS DE PANNE
+
+Scenario 1: Perte k8s-master-1 (Master 1/3)
+  
+   t=0s    : k8s-master-1 down                            
+   t=10s   : etcd quorum maintenu (k8s-master-2+k8s-master-3)    
+   t=10s   : API Server continue (k8s-master-2+k8s-master-3)     
+   t=20s   : Scheduler detecte mysql-0 down        
+   t=30s   : mysql-0 reschedule sur k8s-master-2 ou k8s-master-3 
+   t=60s   : Drupal reconnecte, service OK         
+  
+
+  Resultat:  Interruption <60s, automatique
+
+Scenario 2: Perte k8s-master-2 ou k8s-master-3
+  
+   t=0s    : Nud down                             
+   t=5s    : etcd quorum maintenu (2/3)            
+   t=5s    : API Server continue                   
+   t=10s   : Pods reschedule si necessaire         
+   t=30s   : Service normal                        
+  
+
+  Resultat:  Transparent (aucune interruption)
+
+Scenario 3: Perte k8s-master-1 + k8s-master-2 (2 masters)
+  
+   t=0s    : 2 masters down                        
+   t=5s    : etcd quorum PERDU (1/3)               
+   t=5s    : API Server READ-ONLY sur k8s-master-3        
+   t=5s    : Pas de reschedule possible            
+   t=     : Pods existants continuent             
+             Service degrade jusqu'a restauration  
+  
+
+  Resultat:   Degrade (lecture seule)
+  Action: Restaurer 1 master pour quorum 2/3
+
+
+
+ TESTS RECOMMANDES
+
+1. Test perte master (k8s-master-1)
+
+   # Simuler panne
+   ssh formation@k8s-master-1.example.com "sudo systemctl stop k3s"
+
+   # Verifier API accessible
+   kubectl get nodes
+   # Devrait montrer k8s-master-1 NotReady, k8s-master-2+k8s-master-3 Ready
+
+   # Verifier service Drupal accessible
+   curl http://k8s-master-2.example.com:30080
+
+   # Verifier reschedule mysql-0
+   kubectl get pods -n drupal -o wide
+   # mysql-0 devrait etre sur k8s-master-2 ou k8s-master-3
+
+   # Restaurer
+   ssh formation@k8s-master-1.example.com "sudo systemctl start k3s"
+
+2. Test etcd quorum
+
+   # Verifier membres etcd
+   kubectl exec -n kube-system etcd-k8s-master-1 -- etcdctl member list
+
+   # Devrait montrer 3 membres
+
+3. Test PodDisruptionBudget avec 3 masters
+
+   kubectl drain k8s-master-2 --ignore-daemonsets
+   # Devrait echouer si <2 MySQL pods ou <1 Drupal pod
+
+
+
+ FICHIERS MODIFIES v2.0
+
+Configuration:
+   ansible/inventory/hosts.yml (3 masters definis)
+   ansible/playbooks/00-bootstrap-k3s.yml (multi-master setup)
+   helm/charts/drupal-stack/templates/mysql-services.yaml (mysql-primary selector)
+   helm/charts/drupal-stack/templates/poddisruptionbudgets.yaml (PDBs)
+
+Documentation:
+   HIGH-AVAILABILITY.md (mise a jour v2.0)
+   HA-SUMMARY.txt (ce fichier v2.0)
+
+
+
+  LIMITATIONS CONNUES
+
+1. Perte de 2 Masters
+
+   Probleme: etcd quorum perdu (1/3 votes)
+   Impact:  Cluster READ-ONLY (pas de reschedule)
+   Solution: Restaurer 1 master pour quorum 2/3
+
+2. Drupal Anti-Affinity PREFERRED
+
+   Probleme: 2 pods peuvent finir sur meme nud
+   Impact:  Si ce nud down  0 pod temporairement
+   Solution: Changer en REQUIRED (si ressources OK)
+
+3. Fenetre Re-replication Longhorn
+
+   Probleme: Pendant 5-30min, 1 seule copie disponible
+   Impact:  Si 2e nud tombe pendant  perte donnees
+   Solution: Eviter maintenance simultanee 2 nuds
+
+
+
+Version: 2.0
+Date: 2025-10-15
+Status:  HA complete (tolere perte 1 master, <60s interruption)

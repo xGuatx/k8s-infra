@@ -1,0 +1,87 @@
+# Default values for drupal-stack
+# These can be overridden in production
+
+## Namespace
+namespace: drupal
+
+## MySQL Configuration
+mysql:
+  image:
+    repository: mysql
+    tag: "8.0"
+    pullPolicy: IfNotPresent
+
+  replication:
+    enabled: true
+    replicas: 3
+
+  persistence:
+    storageClass: longhorn
+    size: 2Gi
+
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: 500m
+
+  # Secrets will be injected from Ansible Vault
+  # DO NOT hardcode credentials here
+  auth:
+    existingSecret: mysql-secret
+    rootPasswordKey: mysql-root-password
+    databaseKey: mysql-database
+    userKey: mysql-user
+    passwordKey: mysql-password
+
+## Drupal Configuration
+drupal:
+  image:
+    repository: drupal
+    tag: "10-apache"
+    pullPolicy: IfNotPresent
+
+  replicaCount: 3  # 3 replicas for true HA (1 per node)
+
+  persistence:
+    storageClass: longhorn
+    size: 2Gi
+
+  resources:
+    requests:
+      memory: 512Mi
+      cpu: 250m
+    limits:
+      memory: 1Gi
+      cpu: 500m
+
+  # Database connection uses MySQL secret
+  database:
+    host: mysql-primary.drupal.svc.cluster.local
+    port: 3306
+    existingSecret: mysql-secret
+
+## Service Configuration
+service:
+  type: NodePort
+  drupalPort: 80
+  drupalNodePort: 30080
+
+## Affinity for HA
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      enabled: true
+
+## Health checks
+healthChecks:
+  liveness:
+    initialDelaySeconds: 90
+    periodSeconds: 10
+    timeoutSeconds: 5
+  readiness:
+    initialDelaySeconds: 30
+    periodSeconds: 5
+    timeoutSeconds: 3

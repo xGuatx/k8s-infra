@@ -1,0 +1,215 @@
+---
+- name: Configure Velero for Kubernetes Backups
+  hosts: k8s-orchestrator.example.com
+  become: no
+  gather_facts: no
+  connection: local
+
+  vars:
+    kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+    velero_version: v1.15.0
+    backup_location: /opt/velero-backups
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    # Configure backup storage on k8s-master-1
+    - name: Create backup directory on k8s-master-1
+      delegate_to: "{{ groups['k3s_masters'][0] }}"
+      become: yes
+      file:
+        path: "{{ backup_location }}"
+        state: directory
+        mode: '0755'
+
+    # Install Velero CLI locally (on k8s-orchestrator or wherever playbook runs)
+    - name: Check if Velero CLI is installed
+      stat:
+        path: /usr/local/bin/velero
+      register: velero_cli
+
+    - name: Download and install Velero CLI
+      become: yes
+      block:
+        - name: Download Velero
+          get_url:
+            url: "https://github.com/vmware-tanzu/velero/releases/download/{{ velero_version }}/velero-{{ velero_version }}-linux-amd64.tar.gz"
+            dest: /tmp/velero.tar.gz
+
+        - name: Extract Velero
+          unarchive:
+            src: /tmp/velero.tar.gz
+            dest: /tmp
+            remote_src: yes
+
+        - name: Install Velero binary
+          copy:
+            src: "/tmp/velero-{{ velero_version }}-linux-amd64/velero"
+            dest: /usr/local/bin/velero
+            mode: '0755'
+            remote_src: yes
+      when: not velero_cli.stat.exists
+
+    # Create Velero namespace and credentials
+    - name: Create velero namespace
+      kubernetes.core.k8s:
+        name: velero
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    # Install Velero with filesystem backup
+    - name: Install Velero using Helm
+      kubernetes.core.helm:
+        name: velero
+        chart_ref: vmware-tanzu/velero
+        release_namespace: velero
+        create_namespace: yes
+        values:
+          configuration:
+            backupStorageLocation:
+              - name: default
+                provider: aws
+                bucket: velero-backups
+                config:
+                  region: minio
+                  s3ForcePathStyle: "true"
+                  s3Url: http://minio.velero.svc:9000
+            volumeSnapshotLocation:
+              - name: default
+                provider: aws
+                config:
+                  region: minio
+          credentials:
+            useSecret: true
+            secretContents:
+              cloud: |
+                [default]
+                aws_access_key_id = {{ vault_minio_access_key }}
+                aws_secret_access_key = {{ vault_minio_secret_key }}
+          deployNodeAgent: true
+          initContainers:
+            - name: velero-plugin-for-aws
+              image: velero/velero-plugin-for-aws:v1.10.0
+              volumeMounts:
+                - mountPath: /target
+                  name: plugins
+
+    # Deploy MinIO for backup storage
+    - name: Deploy MinIO for local backup storage
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: minio-pvc
+            namespace: velero
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: longhorn
+            resources:
+              requests:
+                storage: 100Gi
+
+    - name: Deploy MinIO deployment
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: minio
+            namespace: velero
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: minio
+            template:
+              metadata:
+                labels:
+                  app: minio
+              spec:
+                containers:
+                - name: minio
+                  image: minio/minio:latest
+                  args:
+                  - server
+                  - /data
+                  env:
+                  - name: MINIO_ACCESS_KEY
+                    value: "{{ vault_minio_access_key }}"
+                  - name: MINIO_SECRET_KEY
+                    value: "{{ vault_minio_secret_key }}"
+                  ports:
+                  - containerPort: 9000
+                  volumeMounts:
+                  - name: data
+                    mountPath: /data
+                volumes:
+                - name: data
+                  persistentVolumeClaim:
+                    claimName: minio-pvc
+
+    - name: Create MinIO service
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: minio
+            namespace: velero
+          spec:
+            type: ClusterIP
+            ports:
+            - port: 9000
+              targetPort: 9000
+            selector:
+              app: minio
+
+    - name: Wait for MinIO to be ready
+      command: kubectl wait --for=condition=ready pod -l app=minio -n velero --timeout=180s
+
+    # Create initial backup
+    - name: Create velero backup bucket via MinIO
+      shell: |
+        kubectl run -it --rm minio-client --image=minio/mc --restart=Never -n velero -- \
+          mc alias set minio http://minio.velero.svc:9000 {{ vault_minio_access_key }} {{ vault_minio_secret_key }} && \
+          mc mb minio/velero-backups || true
+      register: bucket_result
+      failed_when: false
+
+    # Create backup schedule
+    - name: Create daily backup schedule
+      command: |
+        velero schedule create daily-backup \
+          --schedule="0 2 * * *" \
+          --include-namespaces drupal,monitoring,longhorn-system \
+          --ttl 168h
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: schedule_result
+      failed_when: false
+
+    - name: Display Velero status
+      command: velero backup-location get
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: velero_status
+
+    - name: Show Velero configuration
+      debug:
+        msg:
+          - "=== VELERO BACKUP CONFIGURATION ==="
+          - "{{ velero_status.stdout_lines }}"
+          - ""
+          - "Backup schedule: Daily at 2:00 AM"
+          - "Retention: 7 days (168 hours)"
+          - "Namespaces: drupal, monitoring, longhorn-system"
+          - ""
+          - "Manual backup: velero backup create <name> --include-namespaces drupal"
+          - "Restore: velero restore create --from-backup <backup-name>"

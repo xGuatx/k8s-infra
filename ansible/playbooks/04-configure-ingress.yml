@@ -1,0 +1,373 @@
+---
+- name: Configure Ingress with TLS (Cert-Manager)
+  hosts: k8s-orchestrator.example.com
+  become: no
+  connection: local
+  gather_facts: no
+
+  vars:
+    domain_base: "example.com"
+    tls_enabled: "{{ enable_tls | default('false') }}"
+    tls_staging: "{{ use_staging_tls | default('true') }}"
+
+  tasks:
+    - name: Wait for Cert-Manager to be ready
+      shell: |
+        kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=cert-manager \
+          -n cert-manager \
+          --timeout=300s
+      environment:
+        KUBECONFIG: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+    - name: Create ClusterIssuer for Let's Encrypt Staging
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-staging
+          spec:
+            acme:
+              server: https://acme-staging-v02.api.letsencrypt.org/directory
+              email: admin@example.com
+              privateKeySecretRef:
+                name: letsencrypt-staging-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+      when: tls_enabled == 'true'
+
+    - name: Create ClusterIssuer for Let's Encrypt Production
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: cert-manager.io/v1
+          kind: ClusterIssuer
+          metadata:
+            name: letsencrypt-prod
+          spec:
+            acme:
+              server: https://acme-v02.api.letsencrypt.org/directory
+              email: admin@example.com
+              privateKeySecretRef:
+                name: letsencrypt-prod-key
+              solvers:
+              - http01:
+                  ingress:
+                    class: nginx
+      when: tls_enabled == 'true'
+
+    - name: Deploy Nginx Ingress Controller
+      shell: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx 2>/dev/null || true
+        helm repo update
+
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx \
+          --create-namespace \
+          --set controller.service.type=NodePort \
+          --set controller.service.nodePorts.http=30080 \
+          --set controller.service.nodePorts.https=30443 \
+          --wait --timeout=5m
+      environment:
+        KUBECONFIG: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+    - name: Wait for Nginx Ingress Controller
+      shell: |
+        kubectl wait --for=condition=ready pod \
+          -l app.kubernetes.io/name=ingress-nginx \
+          -n ingress-nginx \
+          --timeout=300s
+      environment:
+        KUBECONFIG: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+    - name: Create Ingress for Drupal (HTTP only)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: drupal-ingress
+            namespace: drupal
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            rules:
+            - host: "k8s-master-1.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-2.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-3.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+      when: tls_enabled == 'false'
+
+    - name: Create Ingress for Drupal (HTTPS with Staging)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: drupal-ingress
+            namespace: drupal
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-staging
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "k8s-master-1.{{ domain_base }}"
+              - "k8s-master-2.{{ domain_base }}"
+              - "k8s-master-3.{{ domain_base }}"
+              secretName: drupal-tls-staging
+            rules:
+            - host: "k8s-master-1.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-2.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-3.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+      when: tls_enabled == 'true' and tls_staging == 'true'
+
+    - name: Create Ingress for Drupal (HTTPS with Production)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: drupal-ingress
+            namespace: drupal
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "k8s-master-1.{{ domain_base }}"
+              - "k8s-master-2.{{ domain_base }}"
+              - "k8s-master-3.{{ domain_base }}"
+              secretName: drupal-tls-prod
+            rules:
+            - host: "k8s-master-1.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-2.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+            - host: "k8s-master-3.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: drupal
+                      port:
+                        number: 80
+      when: tls_enabled == 'true' and tls_staging == 'false'
+
+    - name: Create Ingress for Grafana (HTTP only)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: grafana-ingress
+            namespace: monitoring
+            annotations:
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            rules:
+            - host: "grafana.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-grafana
+                      port:
+                        number: 80
+      when: tls_enabled == 'false'
+
+    - name: Create Ingress for Grafana (HTTPS with Staging)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: grafana-ingress
+            namespace: monitoring
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-staging
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "grafana.{{ domain_base }}"
+              secretName: grafana-tls-staging
+            rules:
+            - host: "grafana.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-grafana
+                      port:
+                        number: 80
+      when: tls_enabled == 'true' and tls_staging == 'true'
+
+    - name: Create Ingress for Grafana (HTTPS with Production)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: grafana-ingress
+            namespace: monitoring
+            annotations:
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/rewrite-target: /
+          spec:
+            ingressClassName: nginx
+            tls:
+            - hosts:
+              - "grafana.{{ domain_base }}"
+              secretName: grafana-tls-prod
+            rules:
+            - host: "grafana.{{ domain_base }}"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kube-prometheus-stack-grafana
+                      port:
+                        number: 80
+      when: tls_enabled == 'true' and tls_staging == 'false'
+
+    - name: Display Ingress Information
+      debug:
+        msg: |
+          
+          INGRESS CONFIGURATION TERMINEE
+          
+
+          TLS Enabled: {{ tls_enabled }}
+          {% if tls_enabled == 'true' %}
+          TLS Mode: {{ 'Staging (Test)' if tls_staging == 'true' else 'Production' }}
+          {% endif %}
+
+          Services disponibles:
+
+          Drupal:
+          {% if tls_enabled == 'true' %}
+          - https://k8s-master-1.{{ domain_base }}
+          - https://k8s-master-2.{{ domain_base }}
+          - https://k8s-master-3.{{ domain_base }}
+          {% else %}
+          - http://k8s-master-1.{{ domain_base }}:30080
+          - http://k8s-master-2.{{ domain_base }}:30080
+          - http://k8s-master-3.{{ domain_base }}:30080
+          {% endif %}
+
+          Grafana:
+          {% if tls_enabled == 'true' %}
+          - https://grafana.{{ domain_base }}
+          {% else %}
+          - http://grafana.{{ domain_base }}:30080
+          {% endif %}
+
+          {% if tls_enabled == 'true' %}
+          Verifier les certificats:
+            kubectl get certificate -n drupal
+            kubectl get certificate -n monitoring
+          {% endif %}
+
+          

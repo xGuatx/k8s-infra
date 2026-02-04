@@ -1,0 +1,214 @@
+---
+- name: Deploy Complete Infrastructure
+  hosts: k8s-orchestrator.example.com
+  gather_facts: no
+  connection: local
+  become: no
+
+  vars:
+    kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+
+  tasks:
+    - name: Ensure kubeconfig exists
+      stat:
+        path: "{{ kubeconfig }}"
+      register: kubeconfig_file
+      failed_when: not kubeconfig_file.stat.exists
+
+    - name: Add Helm repositories
+      kubernetes.core.helm_repository:
+        name: "{{ item.name }}"
+        repo_url: "{{ item.url }}"
+      loop:
+        - { name: 'prometheus-community', url: 'https://prometheus-community.github.io/helm-charts' }
+        - { name: 'jetstack', url: 'https://charts.jetstack.io' }
+        - { name: 'longhorn', url: 'https://charts.longhorn.io' }
+        - { name: 'vmware-tanzu', url: 'https://vmware-tanzu.github.io/helm-charts' }
+
+    - name: Update Helm repositories
+      command: helm repo update
+
+    # 1. Install Longhorn for distributed storage
+    - name: Create longhorn-system namespace
+      kubernetes.core.k8s:
+        name: longhorn-system
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Install Longhorn
+      kubernetes.core.helm:
+        name: longhorn
+        chart_ref: longhorn/longhorn
+        release_namespace: longhorn-system
+        create_namespace: yes
+        values:
+          defaultSettings:
+            defaultReplicaCount: "3"  # 3 replicas for true HA (survives 1 node failure)
+            guaranteedInstanceManagerCPU: "12"
+          persistence:
+            defaultClass: true
+            defaultClassReplicaCount: "3"  # 3 replicas for HA
+
+    - name: Wait for Longhorn to be ready
+      command: kubectl wait --for=condition=ready pod -l app=longhorn-manager -n longhorn-system --timeout=300s
+
+    # 2. Install Cert-Manager for TLS
+    - name: Create cert-manager namespace
+      kubernetes.core.k8s:
+        name: cert-manager
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Install Cert-Manager CRDs
+      command: kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.16.2/cert-manager.crds.yaml
+
+    - name: Install Cert-Manager
+      kubernetes.core.helm:
+        name: cert-manager
+        chart_ref: jetstack/cert-manager
+        release_namespace: cert-manager
+        chart_version: v1.16.2
+        values:
+          installCRDs: false
+          replicaCount: 3  # HA: 3 replicas for cert-manager controller
+          webhook:
+            replicaCount: 3  # HA: 3 replicas for webhook
+          cainjector:
+            replicaCount: 3  # HA: 3 replicas for cainjector
+
+    - name: Wait for Cert-Manager to be ready
+      command: kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=cert-manager -n cert-manager --timeout=180s
+
+    # 3. Create MySQL secrets from Ansible Vault
+    - name: Create drupal namespace (with Helm annotations for adoption)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: drupal
+            labels:
+              app.kubernetes.io/managed-by: Helm
+            annotations:
+              meta.helm.sh/release-name: drupal-stack
+              meta.helm.sh/release-namespace: drupal
+
+    - name: Create MySQL secrets from Vault
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: mysql-secret
+            namespace: drupal
+          type: Opaque
+          stringData:
+            mysql-root-password: "{{ vault_mysql_root_password }}"
+            mysql-database: "{{ vault_mysql_database }}"
+            mysql-user: "{{ vault_mysql_user }}"
+            mysql-password: "{{ vault_mysql_password }}"
+
+    # 4. Deploy Drupal Stack via Helm Chart
+    - name: Install Drupal Stack with Helm
+      kubernetes.core.helm:
+        name: drupal-stack
+        chart_ref: "{{ playbook_dir }}/../../helm/charts/drupal-stack"
+        release_namespace: drupal
+        create_namespace: yes
+        wait: yes
+        wait_timeout: 10m
+
+    - name: Wait for MySQL pods to be ready
+      command: kubectl wait --for=condition=ready pod -l app=mysql -n drupal --timeout=300s
+      retries: 3
+      delay: 10
+      register: mysql_ready
+      until: mysql_ready.rc == 0
+
+    - name: Wait for Drupal pods to be ready
+      command: kubectl wait --for=condition=ready pod -l app=drupal -n drupal --timeout=300s
+      retries: 3
+      delay: 10
+      register: drupal_ready
+      until: drupal_ready.rc == 0
+
+    # 5. Install kube-prometheus-stack
+    - name: Create monitoring namespace
+      kubernetes.core.k8s:
+        name: monitoring
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Template Prometheus values with Vault secrets
+      template:
+        src: "{{ playbook_dir }}/../../helm/values/kube-prometheus-stack-values.yaml.j2"
+        dest: "/tmp/kube-prometheus-stack-values.yaml"
+        mode: '0600'
+
+    - name: Install kube-prometheus-stack
+      kubernetes.core.helm:
+        name: kube-prometheus-stack
+        chart_ref: prometheus-community/kube-prometheus-stack
+        release_namespace: monitoring
+        values_files:
+          - "/tmp/kube-prometheus-stack-values.yaml"
+        wait: yes
+        wait_timeout: 10m
+
+    # 6. Display deployment status
+    - name: Get all nodes
+      command: kubectl get nodes -o wide
+      register: nodes_output
+
+    - name: Get Drupal status
+      command: kubectl get all -n drupal
+      register: drupal_output
+
+    - name: Get Monitoring status
+      command: kubectl get pods -n monitoring
+      register: monitoring_output
+
+    - name: Get Longhorn status
+      command: kubectl get pods -n longhorn-system | head -10
+      register: longhorn_output
+
+    - name: Display cluster status
+      debug:
+        msg:
+          - ""
+          - "        INFRASTRUCTURE DEPLOYMENT COMPLETE              "
+          - ""
+          - ""
+          - "=== CLUSTER NODES ==="
+          - "{{ nodes_output.stdout_lines }}"
+          - ""
+          - "=== DRUPAL NAMESPACE (MySQL + Drupal official) ==="
+          - "{{ drupal_output.stdout_lines }}"
+          - ""
+          - "=== MONITORING NAMESPACE ==="
+          - "{{ monitoring_output.stdout_lines }}"
+          - ""
+          - "=== LONGHORN STORAGE ==="
+          - "{{ longhorn_output.stdout_lines }}"
+          - ""
+          - "=== ACCESS INFORMATION ==="
+          - "Drupal:      http://k8s-master-1.example.com:30080"
+          - "Grafana:     http://k8s-master-1.example.com:30300"
+          - "Prometheus:  http://k8s-master-1.example.com:30090"
+          - "AlertManager: http://k8s-master-1.example.com:30903"
+          - ""
+          - "=== DATABASE ACCESS ==="
+          - "MySQL Primary: mysql-primary.drupal.svc.cluster.local:3306"
+          - "MySQL Read:    mysql-read.drupal.svc.cluster.local:3306"
+          - ""
+          - "=== CREDENTIALS ==="
+          - "Stored securely in Ansible Vault (inventory/group_vars/vault.yml)"
+          - "Access: ansible-vault view inventory/group_vars/vault.yml"

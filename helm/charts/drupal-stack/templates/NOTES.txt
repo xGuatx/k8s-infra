@@ -1,0 +1,16 @@
+Drupal Stack deployed successfully!
+
+MySQL Replication: {{ .Values.mysql.replication.replicas }} replicas
+Drupal Replicas: {{ .Values.drupal.replicaCount }}
+
+Services:
+  - Drupal: http://k8s-master-1.example.com:{{ .Values.service.drupalNodePort }}
+  - MySQL Primary: mysql-primary.{{ .Values.namespace }}.svc.cluster.local:3306
+  - MySQL Read: mysql-read.{{ .Values.namespace }}.svc.cluster.local:3306
+
+IMPORTANT: Secrets must be created before deploying this chart.
+Run: kubectl create secret generic mysql-secret -n {{ .Values.namespace }} \
+  --from-literal=mysql-root-password=<password> \
+  --from-literal=mysql-database=drupal \
+  --from-literal=mysql-user=drupal \
+  --from-literal=mysql-password=<password>

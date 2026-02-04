@@ -1,0 +1,21 @@
+# Template for Ansible Vault secrets
+# Encrypt this file with: ansible-vault encrypt vault.yml
+#
+# Generate with: scripts/00-init-secrets.sh
+
+---
+# SSH/Ansible Credentials
+vault_ansible_password: "GENERATED_PASSWORD"
+vault_ansible_become_password: "GENERATED_PASSWORD"
+
+# MySQL/Database Credentials
+vault_mysql_root_password: "GENERATED_PASSWORD"
+vault_mysql_user: "drupal"
+vault_mysql_password: "GENERATED_PASSWORD"
+vault_mysql_database: "drupal"
+
+# Grafana Credentials
+vault_grafana_admin_password: "GENERATED_PASSWORD"
+
+# Rancher Credentials (if used)
+vault_rancher_password: "GENERATED_PASSWORD"

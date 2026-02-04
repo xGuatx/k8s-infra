@@ -1,0 +1,80 @@
+---
+- name: Deploy Kubernetes Dashboard
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  tasks:
+    - name: Deploy Kubernetes Dashboard via Helm
+      kubernetes.core.helm:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        name: kubernetes-dashboard
+        chart_repo_url: https://kubernetes.github.io/dashboard/
+        chart_ref: kubernetes-dashboard
+        chart_version: 7.4.0
+        release_namespace: kubernetes-dashboard
+        create_namespace: true
+        values:
+          service:
+            type: ClusterIP
+          protocolHttp: false  # HTTPS only
+
+    - name: Create admin ServiceAccount for Dashboard
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: admin-user
+            namespace: kubernetes-dashboard
+
+    - name: Bind admin ServiceAccount to cluster-admin
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: admin-user-binding
+          subjects:
+          - kind: ServiceAccount
+            name: admin-user
+            namespace: kubernetes-dashboard
+          roleRef:
+            kind: ClusterRole
+            name: cluster-admin
+            apiGroup: rbac.authorization.k8s.io
+
+    - name: Expose Dashboard via Ingress (TLS staging)
+      kubernetes.core.k8s:
+        kubeconfig: "{{ playbook_dir }}/../kubeconfig.yaml"
+        state: present
+        definition:
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: kubernetes-dashboard
+            namespace: kubernetes-dashboard
+            annotations:
+              kubernetes.io/ingress.class: "nginx"
+              cert-manager.io/cluster-issuer: "letsencrypt-staging"
+          spec:
+            rules:
+            - host: "dashboardH.example.com"
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: kubernetes-dashboard
+                      port:
+                        number: 443
+            tls:
+            - hosts:
+              - "dashboardH.example.com"
+              secretName: kubernetes-dashboard-tls
+

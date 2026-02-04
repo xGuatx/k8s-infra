@@ -1,0 +1,8 @@
+# Ignore all vault files
+vault.yml
+*-vault.yml
+*.vault
+
+# Ignore plaintext credentials
+credentials.yml
+secrets.yml

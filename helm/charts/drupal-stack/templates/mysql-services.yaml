@@ -1,0 +1,38 @@
+---
+# MySQL Primary Service (for writes)
+# Routes to mysql-0 ONLY (the primary/master node)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-primary
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "drupal-stack.labels" . | nindent 4 }}
+    component: mysql
+    role: primary
+spec:
+  ports:
+  - port: 3306
+    name: mysql
+  clusterIP: None
+  selector:
+    app: mysql
+    statefulset.kubernetes.io/pod-name: mysql-0
+
+---
+# MySQL Read Service (for reads - load balanced)
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-read
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "drupal-stack.labels" . | nindent 4 }}
+    component: mysql
+    role: read
+spec:
+  ports:
+  - port: 3306
+    name: mysql
+  selector:
+    app: mysql

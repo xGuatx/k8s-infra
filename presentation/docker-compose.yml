@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  k8s-presentation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: k8s-infrastructure-presentation
+    ports:
+      - "8087:8080"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    labels:
+      - "description=Infrastructure K3s HA - Presentation Technique"
+      - "maintainer=Formation K8s"
